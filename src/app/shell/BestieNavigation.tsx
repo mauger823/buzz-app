@@ -1,4 +1,9 @@
-import { useContext, useSyncExternalStore, type ReactNode } from "react";
+import {
+  useContext,
+  useMemo,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { agentAvatars } from "../../features/agents/avatar-packs";
 import { bestieChat } from "../../bundled/bestie/chat";
 import { UnreadBadge } from "../../bundled/channels/UnreadBadge";
@@ -55,7 +60,12 @@ export function BestieNavigationProvider({
     session.channels.subscribeList,
     session.channels.list,
   );
-  const channel = bestieChat(channels.channels, viewer, promoted);
+  const channelId = bestieChat(channels.channels, viewer, promoted)?.id;
+  // The list changes with every preview; consumers re-render only on the DM.
+  const conversation = useMemo(
+    () => (channelId ? { session, channelId } : undefined),
+    [session, channelId],
+  );
   const pack = agentAvatars.find((item) => item.url === agent?.avatar);
   const preview = useAvatarPreview(
     pack ? "" : (agent?.avatar ?? ""),
@@ -86,9 +96,7 @@ export function BestieNavigationProvider({
       : undefined;
   return (
     <BestieNavigationContext value={mark}>
-      <BestieConversationContext
-        value={channel ? { session, channelId: channel.id } : undefined}
-      >
+      <BestieConversationContext value={conversation}>
         {children}
       </BestieConversationContext>
     </BestieNavigationContext>
