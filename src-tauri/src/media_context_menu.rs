@@ -14,6 +14,11 @@
 //!   file's name, or null if it failed. A `just desktop` build with a pinned
 //!   viewer plays media from its dev server's relay broker instead, whose
 //!   media URLs on that origin are named the same way.
+//! - An image shows its `buzz-media` URL, which only the app serves. WebKit
+//!   downloads in its network process, which fails that URL as unsupported.
+//!   Buzz leaves a menu download of one (Download Image, or Download Linked
+//!   File on a message image) to fail without a delegate, and downloads the
+//!   same blob from the loopback listener instead.
 //! - `<video>` and `<audio>` play from the tokened loopback listener
 //!   (`relay::media_stream`). Copy … Address, Open … in New Window and
 //!   Share… would hand that URL, token included, to the clipboard, a window
@@ -30,10 +35,11 @@ use std::{
     cell::{OnceCell, RefCell},
     collections::HashSet,
     path::{Path, PathBuf},
+    ptr::NonNull,
     sync::OnceLock,
 };
 
-use block2::Block;
+use block2::{Block, RcBlock};
 use objc2::{
     define_class, msg_send,
     rc::{Retained, Weak},
@@ -43,7 +49,7 @@ use objc2::{
 use objc2_app_kit::{NSEvent, NSMenu, NSUserInterfaceItemIdentification};
 use objc2_foundation::{
     MainThreadMarker, NSData, NSError, NSHTTPURLResponse, NSObjectProtocol, NSProgressReporting,
-    NSString, NSURLResponse, NSURL,
+    NSString, NSURLRequest, NSURLResponse, NSURL,
 };
 use objc2_web_kit::{WKDownload, WKDownloadDelegate, WKWebView};
 use tauri::Emitter as _;
@@ -92,7 +98,7 @@ struct Downloads {
     app: tauri::AppHandle,
     directory: PathBuf,
     /// The loopback listener's base URL, from which `<video>` and `<audio>`
-    /// load.
+    /// load and an image is downloaded.
     stream: Option<String>,
     /// The dev server Buzz loads its pages from, whose relay broker serves
     /// media when a viewer is pinned.
@@ -173,12 +179,9 @@ define_class!(
 impl DownloadDelegate {
     /// The Downloads name for `download`, if it is of relay media.
     fn name(&self, download: &WKDownload) -> Option<String> {
-        let source = unsafe { download.originalRequest() }?
-            .URL()?
-            .absoluteString()?;
         let downloads = self.ivars();
         media_name(
-            &source.to_string(),
+            &source_of(download)?,
             downloads.stream.as_deref(),
             downloads.dev.as_ref(),
         )
@@ -212,6 +215,12 @@ impl DownloadDelegate {
 /// bytes arrive.
 pub(crate) fn fits(expected: i64) -> bool {
     u64::try_from(expected).is_ok_and(|length| length <= MAX_DOWNLOAD)
+}
+
+/// The URL `download` was started for.
+fn source_of(download: &WKDownload) -> Option<String> {
+    let url = unsafe { download.originalRequest() }?.URL()?;
+    Some(url.absoluteString()?.to_string())
 }
 
 /// The destination WebKit accepted for `download`, if any.
@@ -377,12 +386,35 @@ unsafe extern "C-unwind" fn context_menu_did_create_download(
         return;
     };
     if_main(webview, |main| {
-        // Any other download keeps no delegate, and WebKit cancels it as before.
-        let delegate = main
-            .downloads
-            .as_ref()
-            .filter(|delegate| delegate.name(download).is_some());
-        if let Some(delegate) = delegate {
+        let Some(delegate) = main.downloads.as_ref() else {
+            return;
+        };
+        let loopback = source_of(download)
+            .and_then(|source| loopback_source(&source, delegate.ivars().stream.as_deref()?));
+        if let Some(loopback) = loopback {
+            // The network process fails this download, which keeps no
+            // delegate: it cannot load `buzz-media`. Cancelling it races that
+            // failure, and WebKit kills a network process that reports a
+            // download the app has dropped. The listener serves the same image.
+            let Some(url) = NSURL::URLWithString(&NSString::from_str(&loopback)) else {
+                return delegate.notify(None);
+            };
+            let delegate = delegate.clone();
+            let attach = RcBlock::new(move |download: NonNull<WKDownload>| {
+                // SAFETY: WebKit passes the download it started.
+                let download = unsafe { download.as_ref() };
+                unsafe { download.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+            });
+            unsafe {
+                webview.startDownloadUsingRequest_completionHandler(
+                    &NSURLRequest::requestWithURL(&url),
+                    &attach,
+                );
+            }
+        } else if delegate.name(download).is_some() {
+            // Any other download keeps no delegate, and WebKit cancels it as
+            // before. Without a listener an image's fails, which the delegate
+            // reports.
             unsafe { download.setDelegate(Some(ProtocolObject::from_ref(&**delegate))) };
         }
     });
@@ -465,10 +497,20 @@ fn hidden_items(items: &[Item], saves: bool) -> Vec<usize> {
     hidden
 }
 
+/// The loopback URL that serves the relay media `source` names, if it is the
+/// `buzz-media` URL an image shows: the listener's base URL, `stream`, then
+/// the source's path, as the page builds a `<video>`'s. Any other source has
+/// none.
+fn loopback_source(source: &str, stream: &str) -> Option<String> {
+    let path = source.strip_prefix("buzz-media://localhost/")?;
+    crate::relay::download_target(source)?;
+    Some(format!("{stream}{path}"))
+}
+
 /// The Downloads name for a menu download of relay media: the loopback URL
-/// a `<video>` or `<audio>` plays, which ends in its `buzz-media` path, the
-/// `buzz-media` URL an image shows, or the `dev` server's broker media URL.
-/// Any other source has none.
+/// a `<video>` or `<audio>` plays or an image is downloaded from, which ends
+/// in its `buzz-media` path, the `buzz-media` URL an image shows, or the
+/// `dev` server's broker media URL. Any other source has none.
 fn media_name(source: &str, stream: Option<&str>, dev: Option<&Url>) -> Option<String> {
     let path = stream
         .and_then(|base| source.strip_prefix(base))
@@ -617,6 +659,53 @@ mod tests {
                 assert_eq!(media_name(&source, Some(base), dev), None, "{source}");
             }
             assert_eq!(media_name(&format!("{base}{video}"), None, dev), None);
+        }
+    }
+
+    #[test]
+    fn only_a_buzz_media_image_source_maps_to_the_loopback_listener() {
+        let base = "http://127.0.0.1:4321/token/";
+        let hash = "a".repeat(64);
+        let image = encode(&format!("https://relay.test/media/{hash}.png"));
+        let loopback = loopback_source(&format!("buzz-media://localhost/{image}"), base).unwrap();
+        assert_eq!(loopback, format!("{base}{image}"));
+        // The restarted download is named as the image's own URL was.
+        assert_eq!(
+            media_name(&loopback, Some(base), None),
+            Some(format!("{hash}.png"))
+        );
+        // The page's own encoding, which leaves `.` as it is.
+        let page = format!("https%3A%2F%2Frelay.test%2Fmedia%2F{hash}.png");
+        assert_eq!(
+            loopback_source(&format!("buzz-media://localhost/{page}"), base),
+            Some(format!("{base}{page}"))
+        );
+        for source in [
+            // Another host, a port or credentials.
+            format!("buzz-media://example.test/{image}"),
+            format!("buzz-media://localhost.example.test/{image}"),
+            format!("buzz-media://localhost:4321/{image}"),
+            format!("buzz-media://user@localhost/{image}"),
+            // A query or fragment.
+            format!("buzz-media://localhost/{image}?download"),
+            format!("buzz-media://localhost/{image}#t=1"),
+            // A target that is not relay media.
+            format!(
+                "buzz-media://localhost/{}",
+                encode("https://relay.test/other.png")
+            ),
+            format!(
+                "buzz-media://localhost/{}",
+                encode(&format!("https://relay.test/media/{hash}.png?x=1"))
+            ),
+            format!("buzz-media://localhost/{}", encode("file:///etc/passwd")),
+            "buzz-media://localhost/".to_owned(),
+            // Another scheme: a loopback download is never restarted.
+            format!("{base}{image}"),
+            format!("http://buzz-media.localhost/{image}"),
+            format!("https://relay.test/media/{hash}.png"),
+        ] {
+            assert_eq!(loopback_source(&source, base), None, "{source}");
         }
     }
 
