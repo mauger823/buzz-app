@@ -1030,7 +1030,7 @@ pub fn run() {
             }
             #[cfg(unix)]
             if cli_link::owns(
-                cli_link::development(),
+                cli_link::development(tauri::is_dev()),
                 &app.config().identifier,
                 std::env::var_os("APPIMAGE").is_some(),
             ) {
