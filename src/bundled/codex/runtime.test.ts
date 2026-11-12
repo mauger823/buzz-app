@@ -7,6 +7,7 @@ import { bytesToHex } from "nostr-tools/utils";
 import { apply } from "./index";
 import { CodexSetup, explainTurn } from "./setup";
 import { describe, afterEach, expect, it, vi } from "vitest";
+import { assignConversationFolder } from "../../features/agents/conversation-folders";
 import { pubkeyOf } from "../../features/agents/membership";
 import { ownerReads } from "../../features/agents/reads";
 import {
@@ -93,6 +94,7 @@ function fixture(
     host: ConstructorParameters<typeof CodexRuntime>[12];
     handle: ConstructorParameters<typeof CodexRuntime>[13];
   },
+  resolveDirectory?: ConstructorParameters<typeof CodexRuntime>[14],
 ) {
   let terminals = remainingTerminals;
   let options: HostProcessOptions | undefined;
@@ -409,6 +411,7 @@ function fixture(
     undefined,
     security?.host,
     security?.handle,
+    resolveDirectory,
   );
   runtimes.push(runtime);
   const events: EventData[] = [];
@@ -692,6 +695,7 @@ function fixture(
     soloChannels,
     huddleChannels,
     exits,
+    store,
   };
 }
 it("hands over promptly and runs conversations independently on one server", async () => {
@@ -7349,4 +7353,104 @@ it("neither lists nor runs the retired owner-read tools, while its own reads wor
     "OWN_CONVERSATION",
   );
   await f.complete();
+});
+
+describe("a conversation given its own folder", () => {
+  const folders = (missing = new Set<string>()) =>
+    vi.fn(async (path: string, options?: { create?: boolean }) => {
+      if (options?.create === false && missing.has(path))
+        throw new Error(`Could not find ${path}`);
+      return path;
+    });
+  const withFolder = async (
+    resolveDirectory: ReturnType<typeof folders>,
+    folder: string,
+  ) => {
+    const f = fixture(
+      [],
+      undefined,
+      false,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      resolveDirectory,
+    );
+    await assignConversationFolder(
+      f.store,
+      scope,
+      pubkey,
+      `channel/${root}`,
+      folder,
+    );
+    return f;
+  };
+
+  it("starts its thread there and names the agent's workspace", async () => {
+    const resolveDirectory = folders();
+    const f = await withFolder(resolveDirectory, "/repos/worktree");
+    await f.runtime.run(f.delivery("hello"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    expect(resolveDirectory).toHaveBeenCalledWith("/repos/worktree", {
+      create: false,
+    });
+    for (const method of ["config/read", "thread/start"])
+      expect(
+        f.sent.find((wire) => wire.method === method)?.params,
+      ).toMatchObject({ cwd: "/repos/worktree" });
+    expect(
+      String(
+        (
+          f.sent.find((wire) => wire.method === "thread/start")?.params as
+            | { developerInstructions?: string }
+            | undefined
+        )?.developerInstructions,
+      ),
+    ).toContain(
+      "Your persistent workspace is at `/tmp/codex-test`, not in your working directory",
+    );
+    f.complete(0, "DONE");
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+    // Its next turn resumes the thread in the same folder.
+    await f.runtime.run(f.delivery("again"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+    expect(
+      f.sent.find((wire) => wire.method === "thread/resume")?.params,
+    ).toMatchObject({ cwd: "/repos/worktree" });
+    f.complete(1, "DONE AGAIN");
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+  });
+
+  it("refuses its turn, naming the folder, once the folder is gone", async () => {
+    const f = await withFolder(
+      folders(new Set(["/repos/removed"])),
+      "/repos/removed",
+    );
+    await f.runtime.run(f.delivery("hello"));
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+    expect(f.publish.mock.calls[0]?.[0]).toMatchObject({
+      content: expect.stringContaining(
+        "This conversation's folder /repos/removed no longer exists",
+      ),
+    });
+    // It never falls back to the agent's workspace.
+    expect(f.sent.some((wire) => wire.method === "thread/start")).toBe(false);
+    expect(f.starts()).toHaveLength(0);
+  });
+
+  it("leaves other conversations in the workspace", async () => {
+    const resolveDirectory = folders();
+    const f = await withFolder(resolveDirectory, "/repos/worktree");
+    await f.runtime.run(f.delivery("elsewhere", "d".repeat(64)));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    expect(
+      f.sent.find((wire) => wire.method === "thread/start")?.params,
+    ).toMatchObject({ cwd: "/tmp/codex-test" });
+    expect(resolveDirectory).not.toHaveBeenCalled();
+    f.complete(0, "DONE");
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  });
 });

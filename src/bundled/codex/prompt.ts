@@ -4,7 +4,7 @@ import {
   CHANNEL_LEVEL_PROMPT,
 } from "../../buzz-mcp/prompt";
 import {
-  BASE_PROMPT,
+  basePromptFor,
   MENTION_PROMPT,
 } from "../../features/agent-harness/base-prompt";
 import { coreMemorySection } from "../../features/agent-harness/core-memory";
@@ -38,11 +38,14 @@ export const rootOf = (event: EventData) =>
   threadReference(event)?.rootId ?? event.id;
 export function developerInstructions(
   agent: Pick<AgentHandle, "name" | "pubkey">,
+  /** The agent's workspace, absolute, when the thread runs in a folder of
+   * the conversation's own instead. */
+  workspace?: string,
 ) {
   return `You are ${agent.name} (pubkey ${agent.pubkey}), a coding agent in Buzz.
 The buzz namespace provides the shared Buzz tools, including messages, reactions, reads, uploads, canvas, and encrypted memory. Buzz access and signing are handled by the host. Do not invoke the buzz CLI or look for credentials. Use Codex's native coding tools in the workspace.
 
-${BASE_PROMPT}
+${basePromptFor(workspace)}
 
 ${BUZZ_PROMPT}`;
 }
